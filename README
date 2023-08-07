@@ -1,0 +1,48 @@
+# Static Route Tracking based on RPM Monitor for Junos EVO
+
+As of 2023/08/07, Junos EVO does not support static route tracking based on RPM probes.
+This script is to achieve similar feature via JET script.
+
+Use at your own risk!
+
+How To Use:
+1. Upload JET script to the router
+$ scp rpm-monitor.py evouser@192.168.0.1:/var/db/scripts/jet/
+
+2. Enable JET script
+> show configuration system extensions | display set
+set system extensions extension-service application file rpm-monitor.py daemonize
+set system extensions extension-service application file rpm-monitor.py respawn-on-normal-exit
+set system extensions extension-service application file rpm-monitor.py username jcluser
+
+3. Configure static route and RPM probe
+> show configuration services | display set
+set services monitoring rpm owner ipv6-target test 2001::2 apply-macro disable-static-on-fail
+set services monitoring rpm owner ipv6-target test 2001::2 probe-type icmp-ping
+set services monitoring rpm owner ipv6-target test 2001::2 offload-type none
+set services monitoring rpm owner ipv6-target test 2001::2 target 2001::2
+set services monitoring rpm owner ipv6-target test 2001::2 probe-count 1
+set services monitoring rpm owner ipv6-target test 2001::2 probe-interval 1
+set services monitoring rpm owner ipv6-target test 2001::2 test-interval 3
+set services monitoring rpm owner ipv6-target test 2001::2 thresholds successive-loss 3
+
+> show configuration routing-options | display set
+set routing-options rib inet6.0 static route 2001:db8:2::/64 next-hop 2001::2
+
+
+This script checks for "apply-macro disable-static-on-fail" flag under test configuration.
+If you do not set this flag, the script would not deactivate the static route even if there is a next-hop route which is same as the target address.
+
+
+How to Debug:
+1. Check if RPM is failing or passing
+> show services monitoring rpm probe-results status PASS
+> show services monitoring rpm probe-results status FAIL
+
+2. Enable Debug Log
+set system syslog file debug any verbose
+set system syslog file debug match rpm-monitor
+
+3. Check if there is any errors
+show log debug
+show log messages
