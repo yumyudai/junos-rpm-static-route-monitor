@@ -30,31 +30,11 @@ class JunosDevice(object):
         self.current_state = dict()
 
     def check_state(self):
-        # get RPM results
-        rpm_failed = dict()
-        try:
-            rpm_fails = self.dev.rpc.get_rpm_probe_results(status="FAIL")
-            for result in rpm_fails.findall("./probe-test-results"):
-                target_addr = result.findtext("./target-address")
-                rpm_failed[target_addr] = False
-                jcs.syslog("external.debug", f"rpm-monitor: test {target_addr} is failing")
-        except:
-            pass
-
-        rpm_passed = dict()
-        try:
-            rpm_passes = self.dev.rpc.get_rpm_probe_results(status="PASS")
-            for result in rpm_passes.findall("./probe-test-results"):
-                target_addr = result.findtext("./target-address")
-                rpm_passed[target_addr] = False
-                jcs.syslog("external.debug", f"rpm-monitor: test {target_addr} is passing")
-        except:
-            pass 
-
         # get config
         cfg = self.dev.rpc.get_config(options={"database": "committed"})
 
-        # check if we need to disable per apply-macro
+        # check rpm test needs to be checked per apply-macro
+        test_status = dict()
         for elem in cfg.findall("services/monitoring/rpm"):
             for owner_elem in elem.findall("./owner"):
                 for test_elem in owner_elem.findall("./test"):
@@ -75,25 +55,32 @@ class JunosDevice(object):
                     for macro_elem in test_elem.findall("./apply-macro"):
                         macro_name = macro_elem.findtext("./name")
                         if macro_name == "disable-static-on-fail":
-                            rpm_monitor_enabled = True
+                            test_status[target_addr] = -1
                             jcs.syslog("external.debug", f"rpm-monitor: static route check is expected for next-hop {target_addr}")
                         else:
                             jcs.syslog("external.debug", f"rpm-monitor: unknown key {macro_name} for next-hop {target_addr}")
 
-                    if rpm_monitor_enabled is False:
-                        continue
+        # get RPM results
+        try:
+            rpm_fails = self.dev.rpc.get_rpm_probe_results(status="FAIL")
+            for result in rpm_fails.findall("./probe-test-results"):
+                target_addr = result.findtext("./target-address")
+                if target_addr in test_status:
+                    test_status[target_addr] = 0
+                    jcs.syslog("external.debug", f"rpm-monitor: test {target_addr} is failing")
+        except:
+            pass
 
-                    # find in results dict and change flag
-                    if target_addr in rpm_failed:
-                        rpm_failed[target_addr] = True
-                        jcs.syslog("external.debug", f"rpm-monitor: next-hop {target_addr} is failing")
-                    elif target_addr in rpm_passed:
-                        rpm_passed[target_addr] = True
-                        jcs.syslog("external.debug", f"rpm-monitor: next-hop {target_addr} is alive")
-                    else:
-                        # BUG
-                        jcs.syslog("external.notice", f"rpm-monitor: {target_addr} not found in results dictionary")
-                        continue
+        try:
+            # We probably don't need to check but just in case..
+            rpm_passes = self.dev.rpc.get_rpm_probe_results(status="PASS")
+            for result in rpm_passes.findall("./probe-test-results"):
+                target_addr = result.findtext("./target-address")
+                if target_addr in test_status:
+                    test_status[target_addr] = 1
+                    jcs.syslog("external.debug", f"rpm-monitor: test {target_addr} is passing")
+        except:
+            pass 
 
         # find routes associated 
         config_changes = []
@@ -105,9 +92,12 @@ class JunosDevice(object):
                 route = static_elem.findtext("./name")
                 next_hop = static_elem.findtext("./next-hop")
                 jcs.syslog("external.debug", f"rpm-monitor: check route {route} next-hop {next_hop}")
-                if next_hop in rpm_failed and rpm_failed[next_hop] is True and static_elem.get("inactive") is None:
+                if next_hop not in test_status:
+                    jcs.syslog("external.debug", f"rpm-monitor: skip non-monitored next-hop {next_hop} route")
+                    continue
+                elif test_status[next_hop] == 0 and static_elem.get("inactive") is None:
                     config_changes.append(f"deactivate routing-options rib {rib_name} static route {route}")
-                elif next_hop in rpm_passed and rpm_passed[next_hop] is True and static_elem.get("inactive") is not None:
+                elif test_status[next_hop] == 1 and static_elem.get("inactive") is not None:
                     config_changes.append(f"activate routing-options rib {rib_name} static route {route}")
                 else:
                     jcs.syslog("external.debug", f"rpm-monitor: route {route} next-hop {next_hop} does not need config change")
@@ -118,6 +108,12 @@ class JunosDevice(object):
             return
 
         with jnpr.junos.utils.config.Config(self.dev) as cu:
+            try:
+                cu.lock()
+            except:
+                jcs.syslog("external.notice", f"rpm-monitor: failed to get lock on config, retry on next interval")
+                return
+
             for change in config_changes:
                 jcs.syslog("external.notice", f"rpm-monitor: applying config \"{change}\"")
                 try:
@@ -128,6 +124,12 @@ class JunosDevice(object):
 
             cu.commit()
             jcs.syslog("external.notice", f"rpm-monitor: commit complete")
+
+            try:
+                cu.unlock()
+            except:
+                jcs.syslog("external.notice", f"rpm-monitor: failed to unlock config")
+                pass
 
         return
 
